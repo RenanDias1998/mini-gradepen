@@ -5,6 +5,8 @@ from PIL import Image
 import pandas as pd
 import os
 
+st.set_page_config(layout="wide")
+
 st.title("📄 Leitor Inteligente de Gabarito")
 
 # -----------------------------
@@ -13,7 +15,7 @@ st.title("📄 Leitor Inteligente de Gabarito")
 nome = st.text_input("Nome do aluno")
 turma = st.text_input("Turma")
 
-gabarito_texto = st.text_input("Digite o gabarito (ex: C D B D B C B D D A)")
+gabarito_texto = st.text_input("Digite o gabarito (ex: A B C D E A B C D E)")
 
 if gabarito_texto:
     gabarito = gabarito_texto.upper().split()
@@ -21,7 +23,7 @@ else:
     gabarito = []
 
 # -----------------------------
-# CÂMERA DO CELULAR
+# CÂMERA
 # -----------------------------
 foto = st.camera_input("📸 Tire a foto do gabarito")
 
@@ -32,7 +34,6 @@ if foto is not None and nome and turma:
 
     gray = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
 
-    # melhorar contraste
     blur = cv2.GaussianBlur(gray, (5,5), 0)
 
     _, thresh = cv2.threshold(blur, 120, 255, cv2.THRESH_BINARY_INV)
@@ -44,17 +45,17 @@ if foto is not None and nome and turma:
     for c in contornos:
         x, y, w, h = cv2.boundingRect(c)
 
-        # tamanho das bolinhas
         if 20 < w < 80 and 20 < h < 80:
             bolhas.append((x, y, w, h))
 
-    # ordenar de cima pra baixo (vertical)
+    # ordenar vertical
     bolhas = sorted(bolhas, key=lambda b: (b[1], b[0]))
 
     respostas = []
     letras = ["A", "B", "C", "D", "E"]
 
-    # agrupar de 5 em 5 (cada questão)
+    st.subheader("🔍 Diagnóstico de leitura")
+
     for i in range(0, len(bolhas), 5):
         grupo = bolhas[i:i+5]
 
@@ -66,12 +67,32 @@ if foto is not None and nome and turma:
         for (x, y, w, h) in grupo:
             area = thresh[y:y+h, x:x+w]
             total = cv2.countNonZero(area)
-            marcacoes.append(total)
+            area_total = w * h
 
-        resposta = letras[np.argmax(marcacoes)]
+            preenchimento = total / area_total
+            marcacoes.append(preenchimento)
+
+        ordenado = sorted(marcacoes, reverse=True)
+
+        if len(ordenado) >= 2:
+            confianca = ordenado[0] - ordenado[1]
+        else:
+            confianca = 0
+
+        indice = np.argmax(marcacoes)
+
+        # REGRA DE DECISÃO (AJUSTÁVEL)
+        if marcacoes[indice] > 0.25 and confianca > 0.05:
+            resposta = letras[indice]
+        else:
+            resposta = "?"
+
         respostas.append(resposta)
 
-    st.write("📌 Respostas detectadas:", respostas)
+        st.write(f"Q{i//5 + 1}: {marcacoes} → {resposta}")
+
+    st.subheader("📌 Respostas detectadas")
+    st.write(respostas)
 
     # -----------------------------
     # CORREÇÃO
@@ -97,7 +118,8 @@ if foto is not None and nome and turma:
             "Nome": nome,
             "Turma": turma,
             "Acertos": acertos,
-            "Erros": ", ".join(erros)
+            "Erros": ", ".join(erros),
+            "Respostas": " ".join(respostas)
         }
 
         df = pd.DataFrame([dados])
@@ -112,8 +134,10 @@ if foto is not None and nome and turma:
 
         st.success("📊 Resultado salvo!")
 
-        # mostrar lista por turma
-        st.subheader("📚 Lista de resultados")
+        # -----------------------------
+        # MOSTRAR POR TURMA
+        # -----------------------------
+        st.subheader("📚 Lista por turma")
 
         tabela = pd.read_csv(arquivo)
 
