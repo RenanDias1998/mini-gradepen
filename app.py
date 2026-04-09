@@ -9,22 +9,22 @@ st.set_page_config(layout="wide")
 
 st.title("📄 Leitor Inteligente de Gabarito")
 
-st.info("📸 Tire a foto de cima (90°), com boa luz e distância de aproximadamente 30cm")
+st.info("📸 Tire a foto de cima (90°), com boa iluminação e distância aproximada de 30cm")
 
 # -----------------------------
-# DADOS
+# DADOS DO ALUNO
 # -----------------------------
 nome = st.text_input("Nome do aluno")
 turma = st.text_input("Turma")
 
-gabarito_texto = st.text_input("Gabarito (ex: A B C D E A B C D E)")
+gabarito_texto = st.text_input("Digite o gabarito (ex: A B C D E A B C D E)")
 
 gabarito = gabarito_texto.upper().split() if gabarito_texto else []
 
 # -----------------------------
-# CAMERA
+# CÂMERA
 # -----------------------------
-foto = st.camera_input("Tirar foto")
+foto = st.camera_input("📸 Tirar foto do gabarito")
 
 if foto is not None and nome and turma:
 
@@ -33,8 +33,9 @@ if foto is not None and nome and turma:
 
     gray = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
 
-    # melhora MUITO a leitura
+    # melhora contraste e reduz erro de iluminação
     blur = cv2.GaussianBlur(gray, (7,7), 0)
+
     thresh = cv2.adaptiveThreshold(
         blur, 255,
         cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -42,58 +43,55 @@ if foto is not None and nome and turma:
         11, 2
     )
 
-    contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    bolhas = []
-
-    for c in contornos:
-        area = cv2.contourArea(c)
-
-        if 500 < area < 4000:  # filtro mais preciso
-            x, y, w, h = cv2.boundingRect(c)
-            bolhas.append((x, y, w, h))
-
-    # ordenar vertical
-    bolhas = sorted(bolhas, key=lambda b: (b[1], b[0]))
+    altura, largura = thresh.shape
 
     respostas = []
     letras = ["A", "B", "C", "D", "E"]
 
-    st.subheader("🔍 Diagnóstico")
+    num_questoes = len(gabarito) if gabarito else 10
+    colunas = 5
 
-    for i in range(0, len(bolhas), 5):
-        grupo = bolhas[i:i+5]
+    altura_bloco = altura // num_questoes
+    largura_bloco = largura // colunas
 
-        if len(grupo) < 5:
-            continue
+    st.subheader("🔍 Diagnóstico da leitura")
+
+    for i in range(num_questoes):
 
         valores = []
 
-        for (x, y, w, h) in grupo:
-            roi = thresh[y:y+h, x:x+w]
-            total = cv2.countNonZero(roi)
-            area_total = w * h
+        for j in range(colunas):
+
+            y1 = i * altura_bloco
+            y2 = (i + 1) * altura_bloco
+
+            x1 = j * largura_bloco
+            x2 = (j + 1) * largura_bloco
+
+            bloco = thresh[y1:y2, x1:x2]
+
+            total = cv2.countNonZero(bloco)
+            area_total = bloco.size
 
             porcentagem = total / area_total
             valores.append(porcentagem)
 
-        # ordenação para comparar
         maior = max(valores)
         segundo = sorted(valores, reverse=True)[1]
 
         indice = valores.index(maior)
 
-        # 🔥 NOVA REGRA (MUITO MAIS PRECISA)
-        if maior > 0.35 and (maior - segundo) > 0.10:
+        # REGRA DE DECISÃO (AJUSTÁVEL)
+        if maior > 0.30 and (maior - segundo) > 0.08:
             resposta = letras[indice]
         else:
             resposta = "?"
 
         respostas.append(resposta)
 
-        st.write(f"Q{i//5 + 1}: {['%.2f' % v for v in valores]} → {resposta}")
+        st.write(f"Q{i+1}: {['%.2f' % v for v in valores]} → {resposta}")
 
-    st.subheader("📌 Respostas")
+    st.subheader("📌 Respostas detectadas")
     st.write(respostas)
 
     # -----------------------------
@@ -114,13 +112,14 @@ if foto is not None and nome and turma:
         st.error(f"❌ Erros: {erros}")
 
         # -----------------------------
-        # SALVAR
+        # SALVAR RESULTADOS
         # -----------------------------
         dados = {
             "Nome": nome,
             "Turma": turma,
             "Acertos": acertos,
-            "Erros": ", ".join(erros)
+            "Erros": ", ".join(erros),
+            "Respostas": " ".join(respostas)
         }
 
         arquivo = "resultados.csv"
@@ -135,10 +134,10 @@ if foto is not None and nome and turma:
 
         df.to_csv(arquivo, index=False)
 
-        st.success("💾 Salvo!")
+        st.success("💾 Resultado salvo!")
 
 # -----------------------------
-# LISTA + EXCLUIR
+# LISTA + EXCLUSÃO
 # -----------------------------
 st.subheader("📚 Resultados")
 
@@ -147,11 +146,19 @@ arquivo = "resultados.csv"
 if os.path.exists(arquivo):
     df = pd.read_csv(arquivo)
 
-    st.dataframe(df)
+    if len(df) > 0:
+        st.dataframe(df)
 
-    indice = st.number_input("Digite o número da linha para excluir", min_value=0, max_value=len(df)-1, step=1)
+        indice = st.number_input(
+            "Digite o número da linha para excluir",
+            min_value=0,
+            max_value=len(df)-1,
+            step=1
+        )
 
-    if st.button("🗑️ Excluir linha"):
-        df = df.drop(indice)
-        df.to_csv(arquivo, index=False)
-        st.success("Linha excluída! Atualize a página.")
+        if st.button("🗑️ Excluir linha"):
+            df = df.drop(indice).reset_index(drop=True)
+            df.to_csv(arquivo, index=False)
+            st.success("Linha excluída! Atualize a página.")
+    else:
+        st.warning("Nenhum resultado salvo ainda.")
