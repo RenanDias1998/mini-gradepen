@@ -33,7 +33,7 @@ if foto is not None and nome and turma:
 
     gray = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
 
-    # melhora contraste e reduz erro de iluminação
+    # melhora contraste
     blur = cv2.GaussianBlur(gray, (7,7), 0)
 
     thresh = cv2.adaptiveThreshold(
@@ -81,8 +81,8 @@ if foto is not None and nome and turma:
 
         indice = valores.index(maior)
 
-        # REGRA DE DECISÃO (AJUSTÁVEL)
-        if maior > 0.30 and (maior - segundo) > 0.08:
+        # 🔥 MAIS RIGOROSO
+        if maior > 0.35 and (maior - segundo) > 0.08:
             resposta = letras[indice]
         else:
             resposta = "?"
@@ -137,7 +137,7 @@ if foto is not None and nome and turma:
         st.success("💾 Resultado salvo!")
 
 # -----------------------------
-# LISTA + EXCLUSÃO
+# LISTA DE RESULTADOS
 # -----------------------------
 st.subheader("📚 Resultados")
 
@@ -148,17 +148,5 @@ if os.path.exists(arquivo):
 
     if len(df) > 0:
         st.dataframe(df)
-
-        indice = st.number_input(
-            "Digite o número da linha para excluir",
-            min_value=0,
-            max_value=len(df)-1,
-            step=1
-        )
-
-        if st.button("🗑️ Excluir linha"):
-            df = df.drop(indice).reset_index(drop=True)
-            df.to_csv(arquivo, index=False)
-            st.success("Linha excluída! Atualize a página.")
     else:
         st.warning("Nenhum resultado salvo ainda.")
