@@ -1,1 +1,0 @@
-removendo app antigo
