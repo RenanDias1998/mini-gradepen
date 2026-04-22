@@ -39,11 +39,14 @@ def init_state():
         "active_exam_code": "",
         "active_exam": None,
         "nav_page": "1. Criar prova",
+        "sidebar_page": "1. Criar prova",
         "draft_exam_header": DEFAULT_EXAM_HEADER,
         "draft_objective_texts": [""] * TOTAL_QUESTIONS,
+        "draft_objective_options": [[f"Alternativa {choice}" for choice in CHOICES] for _ in range(TOTAL_QUESTIONS)],
         "draft_essay_texts": [],
         "exam_header_data": DEFAULT_EXAM_HEADER,
         "objective_texts_data": [""] * TOTAL_QUESTIONS,
+        "objective_options_data": [[f"Alternativa {choice}" for choice in CHOICES] for _ in range(TOTAL_QUESTIONS)],
         "essay_texts_data": [],
     }
     for key, value in defaults.items():
@@ -80,6 +83,7 @@ def generate_exam_code(title, exam_date):
 
 def go_to_page(page_name):
     st.session_state.nav_page = page_name
+    st.session_state.sidebar_page = page_name
     st.rerun()
 
 
@@ -94,6 +98,14 @@ def ensure_question_drafts(objective_count, essay_count):
         current_objectives = current_objectives[:objective_count]
     st.session_state.draft_objective_texts = current_objectives
 
+    current_options = st.session_state.draft_objective_options
+    default_option_row = [f"Alternativa {choice}" for choice in CHOICES]
+    if len(current_options) < objective_count:
+        current_options = current_options + [default_option_row.copy() for _ in range(objective_count - len(current_options))]
+    else:
+        current_options = current_options[:objective_count]
+    st.session_state.draft_objective_options = current_options
+
     current_essays = st.session_state.draft_essay_texts
     if len(current_essays) < essay_count:
         current_essays = current_essays + [""] * (essay_count - len(current_essays))
@@ -107,6 +119,13 @@ def ensure_question_drafts(objective_count, essay_count):
     else:
         base_objectives = base_objectives[:objective_count]
     st.session_state.objective_texts_data = base_objectives
+
+    base_objective_options = st.session_state.objective_options_data
+    if len(base_objective_options) < objective_count:
+        base_objective_options = base_objective_options + [default_option_row.copy() for _ in range(objective_count - len(base_objective_options))]
+    else:
+        base_objective_options = base_objective_options[:objective_count]
+    st.session_state.objective_options_data = base_objective_options
 
     base_essays = st.session_state.essay_texts_data
     if len(base_essays) < essay_count:
@@ -179,6 +198,7 @@ def map_exam_record(record, answer_key_records=None):
         "updated_at": record.get("atualizado_em", ""),
         "header": DEFAULT_EXAM_HEADER,
         "objective_texts": [""] * int(record.get("qtd_objetivas", TOTAL_QUESTIONS)),
+        "objective_options": [[f"Alternativa {choice}" for choice in CHOICES] for _ in range(int(record.get("qtd_objetivas", TOTAL_QUESTIONS)))],
         "essay_texts": [""] * int(record.get("qtd_dissertativas", 0)),
     }
 
@@ -237,7 +257,7 @@ def save_exam(exam):
         .execute()
     )
     saved_exam = map_exam_record(fresh_exam.data)
-    for optional_key in ("header", "objective_texts", "essay_texts"):
+    for optional_key in ("header", "objective_texts", "objective_options", "essay_texts"):
         if optional_key in exam:
             saved_exam[optional_key] = exam[optional_key]
     return saved_exam
@@ -317,6 +337,7 @@ def set_active_exam(exam):
     st.session_state.draft_answer_key = exam["answer_key"].copy()
     st.session_state.exam_header_data = exam.get("header", "")
     st.session_state.objective_texts_data = exam.get("objective_texts", []).copy()
+    st.session_state.objective_options_data = exam.get("objective_options", []).copy()
     st.session_state.essay_texts_data = exam.get("essay_texts", []).copy()
 
 
@@ -879,7 +900,12 @@ def generate_printable_template(exam, exam_url):
     objective_questions = get_exam_objective_count(exam)
     essay_questions = get_exam_essay_count(exam)
     for question_index in range(objective_questions):
-        bubbles = "".join('<div class="bubble"></div>' for _ in CHOICES)
+        option_labels = exam.get("objective_options", [])
+        current_options = option_labels[question_index] if question_index < len(option_labels) else [f"Alternativa {choice}" for choice in CHOICES]
+        bubbles = "".join(
+            f'<div style="text-align:center;"><div class="bubble"></div><div style="font-size:8px; margin-top:1mm;">{current_options[idx]}</div></div>'
+            for idx, _ in enumerate(CHOICES)
+        )
         rows_html.append(
             f'<div class="answer-row"><div class="question-label">Q{question_index + 1}</div>{bubbles}</div>'
         )
@@ -1169,6 +1195,12 @@ def render_create_exam_page():
         widget_key = f"objective_text_{question_index}"
         if widget_key not in st.session_state and question_index < len(st.session_state.objective_texts_data):
             st.session_state[widget_key] = st.session_state.objective_texts_data[question_index]
+        for choice_index, choice in enumerate(CHOICES):
+            option_key = f"objective_option_{question_index}_{choice}"
+            if option_key not in st.session_state and question_index < len(st.session_state.objective_options_data):
+                options_row = st.session_state.objective_options_data[question_index]
+                if choice_index < len(options_row):
+                    st.session_state[option_key] = options_row[choice_index]
     for question_index in range(int(essay_questions)):
         widget_key = f"essay_text_{question_index}"
         if widget_key not in st.session_state and question_index < len(st.session_state.essay_texts_data):
@@ -1184,12 +1216,22 @@ def render_create_exam_page():
 
     st.markdown("**Questoes objetivas**")
     for question_index in range(int(objective_questions)):
-        st.session_state.draft_objective_texts[question_index] = st.text_area(
-            f"Enunciado da objetiva Q{question_index + 1}",
-            key=f"objective_text_{question_index}",
-            height=80,
-            placeholder=f"Digite aqui o enunciado da questao objetiva {question_index + 1}",
-        )
+        with st.container(border=True):
+            st.markdown(f"**Questao objetiva Q{question_index + 1}**")
+            st.session_state.draft_objective_texts[question_index] = st.text_area(
+                f"Enunciado da objetiva Q{question_index + 1}",
+                key=f"objective_text_{question_index}",
+                height=80,
+                label_visibility="collapsed",
+                placeholder=f"Digite aqui o enunciado da questao objetiva {question_index + 1}",
+            )
+            option_cols = st.columns(len(CHOICES))
+            for choice_index, choice in enumerate(CHOICES):
+                st.session_state.draft_objective_options[question_index][choice_index] = option_cols[choice_index].text_input(
+                    f"Alternativa {choice} da Q{question_index + 1}",
+                    key=f"objective_option_{question_index}_{choice}",
+                    placeholder=f"Texto da alternativa {choice}",
+                )
 
     if int(essay_questions) > 0:
         st.markdown("**Questoes dissertativas**")
@@ -1222,6 +1264,7 @@ def render_create_exam_page():
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "header": exam_header,
                 "objective_texts": st.session_state.draft_objective_texts[: int(objective_questions)],
+                "objective_options": st.session_state.draft_objective_options[: int(objective_questions)],
                 "essay_texts": st.session_state.draft_essay_texts[: int(essay_questions)],
             }
             saved_exam = save_exam(exam)
@@ -1399,12 +1442,17 @@ def main():
     page = st.sidebar.radio(
         "Etapas",
         ["1. Criar prova", "2. Definir gabarito", "3. Corrigir gabaritos"],
-        key="nav_page",
+        key="sidebar_page",
+        index=["1. Criar prova", "2. Definir gabarito", "3. Corrigir gabaritos"].index(st.session_state.nav_page),
     )
+    if page != st.session_state.nav_page:
+        st.session_state.nav_page = page
 
-    if page == "1. Criar prova":
+    current_page = st.session_state.nav_page
+
+    if current_page == "1. Criar prova":
         render_create_exam_page()
-    elif page == "2. Definir gabarito":
+    elif current_page == "2. Definir gabarito":
         render_answer_key_page()
     else:
         render_correction_page()
