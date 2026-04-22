@@ -1,8 +1,6 @@
 import base64
-import json
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
 from urllib.parse import urlencode
 
 import cv2
@@ -11,6 +9,7 @@ import pandas as pd
 import qrcode
 import streamlit as st
 from PIL import Image
+from supabase import Client, create_client
 
 
 CHOICES = ["A", "B", "C", "D", "E"]
@@ -21,15 +20,11 @@ DEFAULT_GRID = {
     "columns": np.array([218, 354, 490, 626, 762], dtype=np.int32),
     "rows": np.array([282, 376, 469, 563, 657, 751, 844, 938, 1032, 1126], dtype=np.int32),
 }
-EXAMS_FILE = Path("provas.json")
-
-
 def init_state():
     defaults = {
         "draft_answer_key": [""] * TOTAL_QUESTIONS,
         "saved_answer_key": [],
         "saved_answer_key_version": 0,
-        "class_results": [],
         "last_processed": None,
         "active_exam_code": "",
         "active_exam": None,
@@ -48,8 +43,22 @@ def bgr_to_rgb(image):
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def answer_key_complete(answer_key):
-    return len(answer_key) == TOTAL_QUESTIONS and all(answer_key)
+def answer_key_complete(answer_key, total_questions=TOTAL_QUESTIONS):
+    return len(answer_key) >= total_questions and all(answer_key[:total_questions])
+
+
+def get_exam_objective_count(exam):
+    return int(exam.get("objective_questions", TOTAL_QUESTIONS))
+
+
+def get_exam_essay_count(exam):
+    return int(exam.get("essay_questions", 0))
+
+
+def generate_exam_code(title, exam_date):
+    base = slugify_exam_code(f"{title}-{exam_date}")
+    timestamp = datetime.now().strftime("%H%M")
+    return f"{base}-{timestamp}" if base else f"PROVA-{timestamp}"
 
 
 def slugify_exam_code(text):
@@ -65,17 +74,135 @@ def slugify_exam_code(text):
     return slug or "PROVA"
 
 
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+
+def map_exam_record(record, answer_key_records=None):
+    answers = []
+    if answer_key_records:
+        sorted_records = sorted(answer_key_records, key=lambda item: item["questao"])
+        answers = [item["resposta"] for item in sorted_records]
+    elif "gabaritos" in record and record["gabaritos"]:
+        sorted_records = sorted(record["gabaritos"], key=lambda item: item["questao"])
+        answers = [item["resposta"] for item in sorted_records]
+
+    return {
+        "id": record["id"],
+        "code": record["codigo"],
+        "title": record["titulo"],
+        "date": record.get("data_prova") or "",
+        "objective_questions": int(record.get("qtd_objetivas", TOTAL_QUESTIONS)),
+        "essay_questions": int(record.get("qtd_dissertativas", 0)),
+        "answer_key": answers,
+        "version": int(record.get("versao", 1)),
+        "updated_at": record.get("atualizado_em", ""),
+    }
+
+
 def load_exams():
-    if not EXAMS_FILE.exists():
-        return {}
-    try:
-        return json.loads(EXAMS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    supabase = get_supabase()
+    response = (
+        supabase.table("provas")
+        .select("id,codigo,titulo,data_prova,qtd_objetivas,qtd_dissertativas,versao,atualizado_em,gabaritos(questao,resposta)")
+        .order("titulo")
+        .execute()
+    )
+    exams = {}
+    for record in response.data or []:
+        exam = map_exam_record(record)
+        exams[exam["code"]] = exam
+    return exams
 
 
-def save_exams(exams):
-    EXAMS_FILE.write_text(json.dumps(exams, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_exam(exam):
+    supabase = get_supabase()
+    payload = {
+        "codigo": exam["code"],
+        "titulo": exam["title"],
+        "data_prova": exam["date"] or None,
+        "qtd_objetivas": exam["objective_questions"],
+        "qtd_dissertativas": exam["essay_questions"],
+        "versao": exam.get("version", 1),
+        "atualizado_em": datetime.now().isoformat(),
+    }
+    response = (
+        supabase.table("provas")
+        .upsert(payload, on_conflict="codigo")
+        .execute()
+    )
+    record = response.data[0]
+
+    supabase.table("gabaritos").delete().eq("prova_id", record["id"]).execute()
+    answer_key = exam.get("answer_key", [])
+    if answer_key:
+        rows = [
+            {
+                "prova_id": record["id"],
+                "questao": index + 1,
+                "resposta": answer,
+            }
+            for index, answer in enumerate(answer_key)
+        ]
+        supabase.table("gabaritos").insert(rows).execute()
+
+    fresh_exam = (
+        supabase.table("provas")
+        .select("id,codigo,titulo,data_prova,qtd_objetivas,qtd_dissertativas,versao,atualizado_em,gabaritos(questao,resposta)")
+        .eq("codigo", exam["code"])
+        .single()
+        .execute()
+    )
+    return map_exam_record(fresh_exam.data)
+
+
+def load_results(exam_code=None):
+    supabase = get_supabase()
+    query = (
+        supabase.table("resultados")
+        .select("id,aluno,turma,acertos,erros,respostas_lidas,questoes_certas,questoes_erradas,criado_em,provas(codigo,titulo,data_prova)")
+        .order("aluno")
+    )
+    if exam_code:
+        query = query.eq("provas.codigo", exam_code)
+    response = query.execute()
+
+    records = []
+    for item in response.data or []:
+        prova = item.get("provas") or {}
+        records.append(
+            {
+                "Prova": prova.get("titulo", ""),
+                "Codigo Prova": prova.get("codigo", ""),
+                "Data Prova": prova.get("data_prova", ""),
+                "Aluno": item.get("aluno", ""),
+                "Turma": item.get("turma", ""),
+                "Acertos": item.get("acertos", 0),
+                "Erros": item.get("erros", 0),
+                "Questoes Certas": item.get("questoes_certas", ""),
+                "Questoes Erradas": item.get("questoes_erradas", ""),
+                "Respostas Lidas": item.get("respostas_lidas", ""),
+            }
+        )
+    return records
+
+
+def save_result(record, exam_id):
+    supabase = get_supabase()
+    payload = {
+        "prova_id": exam_id,
+        "aluno": record["Aluno"],
+        "turma": record["Turma"],
+        "acertos": record["Acertos"],
+        "erros": record["Erros"],
+        "respostas_lidas": record["Respostas Lidas"],
+        "questoes_certas": record["Questoes Certas"],
+        "questoes_erradas": record["Questoes Erradas"],
+    }
+    supabase.table("resultados").insert(payload).execute()
 
 
 def build_exam_url(base_url, exam_code):
@@ -507,11 +634,11 @@ def select_answer(question_index, choice):
     st.session_state.draft_answer_key[question_index] = choice
 
 
-def render_answer_key_editor():
+def render_answer_key_editor(total_questions):
     st.subheader("Gabarito do professor")
     st.caption("Clique na alternativa de cada questao. A escolha permanece ate voce salvar.")
 
-    for question_index in range(TOTAL_QUESTIONS):
+    for question_index in range(total_questions):
         current_choice = st.session_state.draft_answer_key[question_index]
         row_columns = st.columns([1.2, 1, 1, 1, 1, 1, 1.6])
         row_columns[0].markdown(f"**Q{question_index + 1}**")
@@ -561,6 +688,9 @@ def compute_score(student_answers, saved_answer_key):
 
 
 def build_student_record(name, class_name, exam, student_answers, correct_answers, comparisons):
+    total_questions = len(exam["answer_key"])
+    correct_questions = [f"Q{item['questao']}" for item in comparisons if item["status"] == "Acerto"]
+    wrong_questions = [f"Q{item['questao']}" for item in comparisons if item["status"] == "Erro"]
     record = {
         "Prova": exam["title"],
         "Codigo Prova": exam["code"],
@@ -568,10 +698,12 @@ def build_student_record(name, class_name, exam, student_answers, correct_answer
         "Aluno": name or "Nao informado",
         "Turma": class_name or "Nao informada",
         "Acertos": correct_answers,
-        "Erros": TOTAL_QUESTIONS - correct_answers,
+        "Erros": total_questions - correct_answers,
         "Respostas Lidas": " ".join(student_answers),
         "Gabarito Usado": " ".join(exam["answer_key"]),
         "Versao Gabarito": exam.get("version", 1),
+        "Questoes Certas": ", ".join(correct_questions),
+        "Questoes Erradas": ", ".join(wrong_questions),
     }
 
     for item in comparisons:
@@ -581,11 +713,14 @@ def build_student_record(name, class_name, exam, student_answers, correct_answer
     return record
 
 
-def export_results_to_excel():
-    if not st.session_state.class_results:
-        return None
+def export_results_to_excel(dataframe=None):
+    if dataframe is None:
+        if not st.session_state.class_results:
+            return None
+        dataframe = pd.DataFrame(st.session_state.class_results)
 
-    data = pd.DataFrame(st.session_state.class_results)
+    if dataframe.empty:
+        return None
     ordered_columns = [
         "Prova",
         "Codigo Prova",
@@ -594,6 +729,8 @@ def export_results_to_excel():
         "Turma",
         "Acertos",
         "Erros",
+        "Questoes Certas",
+        "Questoes Erradas",
         "Respostas Lidas",
         "Gabarito Usado",
         "Versao Gabarito",
@@ -603,7 +740,7 @@ def export_results_to_excel():
         ordered_columns.append(f"Q{question_index}")
         ordered_columns.append(f"Q{question_index}_status")
 
-    data = data[[column for column in ordered_columns if column in data.columns]]
+    data = dataframe[[column for column in ordered_columns if column in dataframe.columns]]
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -613,16 +750,23 @@ def export_results_to_excel():
     return output
 
 
-def render_saved_results():
+def render_saved_results(active_exam_code=None):
     st.subheader("Turma corrigida")
-    if not st.session_state.class_results:
+    records = load_results(active_exam_code)
+    if not records:
         st.info("Nenhum aluno foi salvo ainda.")
         return
 
-    dataframe = pd.DataFrame(st.session_state.class_results)
+    dataframe = pd.DataFrame(records)
+
+    if dataframe.empty:
+        st.info("Nenhum aluno salvo para esta prova ainda.")
+        return
+
+    dataframe = dataframe.sort_values(["Aluno", "Turma"], kind="stable").reset_index(drop=True)
     st.dataframe(dataframe, use_container_width=True)
 
-    excel_file = export_results_to_excel()
+    excel_file = export_results_to_excel(dataframe)
     if excel_file is not None:
         st.download_button(
             "Baixar Excel da turma",
@@ -645,7 +789,9 @@ def generate_printable_template(exam, exam_url):
     )
 
     rows_html = []
-    for question_index in range(TOTAL_QUESTIONS):
+    objective_questions = get_exam_objective_count(exam)
+    essay_questions = get_exam_essay_count(exam)
+    for question_index in range(objective_questions):
         bubbles = "".join('<div class="bubble"></div>' for _ in CHOICES)
         rows_html.append(
             f'<div class="answer-row"><div class="question-label">Q{question_index + 1}</div>{bubbles}</div>'
@@ -710,7 +856,7 @@ def generate_printable_template(exam, exam_url):
     <section class="header">
       <div class="header-top">
         <div class="title">{exam["title"]}</div>
-        <div class="subtitle">Codigo: {exam["code"]} | Data: {exam.get("date", "") or "-"}</div>
+        <div class="subtitle">Codigo: {exam["code"]} | Data: {exam.get("date", "") or "-"} | Objetivas: {objective_questions} | Dissertativas: {essay_questions}</div>
       </div>
       <div class="meta-grid">
         <div class="field"><div class="field-label">Nome do aluno</div><div class="field-line"></div></div>
@@ -747,144 +893,177 @@ def generate_printable_template(exam, exam_url):
     </section>
     <footer class="footer">
       <div>Gabarito vinculado a prova cadastrada no site.</div>
-      <div>QR e link apontam para a consulta automatica desta prova.</div>
+      <div>Objetivas: {objective_questions} | Dissertativas: {essay_questions}</div>
     </footer>
   </main>
 </body>
 </html>"""
 
 
-def render_exam_registry():
-    st.subheader("Cadastro da prova")
-    st.caption("Salve a prova no site para gerar um link fixo e um QR code reutilizavel.")
+def render_exam_selector(exams, label="Selecione uma prova"):
+    if not exams:
+        st.info("Nenhuma prova cadastrada ainda.")
+        return None
+
+    codes = sorted(exams.keys())
+    selected_code = st.selectbox(
+        label,
+        options=[""] + codes,
+        format_func=lambda code: "Escolha uma prova" if not code else f"{code} - {exams[code]['title']}",
+        key=f"selector_{label}",
+    )
+    if selected_code:
+        return exams[selected_code]
+    return None
+
+
+def render_create_exam_page():
+    st.subheader("1. Criar prova")
+    st.caption("Cadastre a estrutura da prova. A leitura automatica cobre as objetivas; as dissertativas ficam registradas no cadastro.")
 
     exam_title = st.text_input("Titulo da prova", key="exam_title_input")
     exam_date = st.text_input("Data da prova", key="exam_date_input", value=datetime.now().strftime("%Y-%m-%d"))
-    exam_code_raw = st.text_input("Codigo da prova", key="exam_code_input", help="Exemplo: MAT-2026-04-22")
+    objective_questions = st.number_input(
+        "Quantidade de questoes objetivas",
+        min_value=1,
+        max_value=TOTAL_QUESTIONS,
+        value=min(10, TOTAL_QUESTIONS),
+        step=1,
+        key="objective_questions_input",
+    )
+    essay_questions = st.number_input(
+        "Quantidade de questoes dissertativas",
+        min_value=0,
+        max_value=20,
+        value=0,
+        step=1,
+        key="essay_questions_input",
+    )
     base_url = st.text_input(
-        "URL publica do app",
+        "URL publica do app (opcional)",
         key="base_url_input",
-        help="Exemplo: https://seu-app.streamlit.app",
+        help="No Streamlit Cloud, e algo como https://nome-do-app.streamlit.app",
     )
 
-    render_answer_key_editor()
+    generated_code = generate_exam_code(exam_title or "PROVA", exam_date or datetime.now().strftime("%Y-%m-%d"))
+    st.code(generated_code, language="text")
+    st.caption("Esse codigo sera salvo com a prova e usado no link/QR quando voce quiser gerar consulta automatica.")
 
-    exam_code = slugify_exam_code(exam_code_raw or exam_title or "PROVA")
-    if exam_code_raw and exam_code_raw != exam_code:
-        st.caption(f"Codigo normalizado para uso na URL: `{exam_code}`")
-
-    action_col1, action_col2 = st.columns([1.2, 1.8])
     exams = load_exams()
-
-    if action_col1.button("Salvar prova cadastrada", type="primary", use_container_width=True):
+    if st.button("Salvar estrutura da prova", type="primary", use_container_width=True):
         if not exam_title.strip():
             st.warning("Informe um titulo para a prova.")
-        elif not answer_key_complete(st.session_state.draft_answer_key):
-            st.warning("Preencha todas as questoes antes de salvar.")
         else:
-            current_version = exams.get(exam_code, {}).get("version", 0) + 1
             exam = {
-                "code": exam_code,
+                "code": generated_code,
                 "title": exam_title.strip(),
                 "date": exam_date.strip(),
-                "answer_key": st.session_state.draft_answer_key.copy(),
-                "version": current_version,
+                "objective_questions": int(objective_questions),
+                "essay_questions": int(essay_questions),
+                "answer_key": [""] * int(objective_questions),
+                "version": exams.get(generated_code, {}).get("version", 0),
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
-            exams[exam_code] = exam
-            save_exams(exams)
-            set_active_exam(exam)
-            st.success("Prova salva. Agora o link e o QR code podem ser usados para abrir esta prova.")
+            saved_exam = save_exam(exam)
+            set_active_exam(saved_exam)
+            st.session_state.current_page = "2. Definir gabarito"
+            st.success("Prova criada. O proximo passo e definir o gabarito.")
 
-    if action_col2.button("Carregar prova cadastrada selecionada", use_container_width=True):
-        selected_code = st.session_state.get("selected_exam_code", "")
-        if selected_code and selected_code in exams:
-            set_active_exam(exams[selected_code])
-            st.success(f"Prova '{selected_code}' carregada.")
-
-    if exams:
-        codes = list(exams.keys())
-        selected_code = st.selectbox(
-            "Provas cadastradas",
-            options=[""] + codes,
-            format_func=lambda code: "Selecione uma prova" if not code else f"{code} - {exams[code]['title']}",
-            key="selected_exam_code",
-        )
-        if selected_code:
-            selected_exam = exams[selected_code]
-            st.caption(
-                f"Ultima atualizacao: {selected_exam.get('updated_at', '-')} | Gabarito: {' '.join(selected_exam['answer_key'])}"
-            )
-    else:
-        st.info("Nenhuma prova cadastrada ainda.")
-
-    active_exam = st.session_state.active_exam
-    if active_exam:
-        exam_url = build_exam_url(base_url, active_exam["code"])
+    selected_exam = render_exam_selector(exams, "Provas ja cadastradas")
+    if selected_exam:
+        exam_url = build_exam_url(base_url, selected_exam["code"])
         st.markdown(
-            f"**Prova ativa:** `{active_exam['code']}` - {active_exam['title']} | Gabarito: {' '.join(active_exam['answer_key'])}"
+            f"**Codigo:** `{selected_exam['code']}` | Objetivas: {get_exam_objective_count(selected_exam)} | Dissertativas: {get_exam_essay_count(selected_exam)}"
         )
         if exam_url:
             st.code(exam_url, language="text")
-            qr_image = build_qr_image(exam_url)
-            st.image(qr_image, caption="QR code da prova ativa", width=220)
+            st.image(build_qr_image(exam_url), caption="QR da prova", width=220)
         else:
-            st.info("Preencha a URL publica do app para gerar o link e o QR.")
+            st.info("Se voce preencher a URL publica do app, o QR e o link serao gerados aqui.")
 
-        printable_html = generate_printable_template(active_exam, exam_url)
-        st.download_button(
-            "Baixar modelo HTML desta prova",
-            data=printable_html.encode("utf-8"),
-            file_name=f"modelo_{active_exam['code'].lower()}.html",
-            mime="text/html",
-            use_container_width=True,
-        )
+
+def render_answer_key_page():
+    st.subheader("2. Definir gabarito")
+    exams = load_exams()
+    exam = st.session_state.active_exam or render_exam_selector(exams, "Escolha a prova para definir o gabarito")
+    if exam is None:
+        return
+
+    if st.session_state.active_exam_code != exam["code"]:
+        set_active_exam(exam)
+
+    total_questions = get_exam_objective_count(exam)
+    st.markdown(
+        f"**Prova:** {exam['title']} | **Codigo:** `{exam['code']}` | Objetivas: {total_questions} | Dissertativas: {get_exam_essay_count(exam)}"
+    )
+    render_answer_key_editor(total_questions)
+
+    col1, col2 = st.columns([1.2, 1.2])
+    if col1.button("Salvar gabarito desta prova", type="primary", use_container_width=True):
+        if not answer_key_complete(st.session_state.draft_answer_key, total_questions):
+            st.warning("Preencha todas as questoes objetivas antes de salvar.")
+        else:
+            saved_exam = exam.copy()
+            saved_exam["answer_key"] = st.session_state.draft_answer_key[:total_questions]
+            saved_exam["version"] = int(saved_exam.get("version", 0)) + 1
+            saved_exam["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            persisted_exam = save_exam(saved_exam)
+            set_active_exam(persisted_exam)
+            st.session_state.current_page = "3. Corrigir gabaritos"
+            st.success("Gabarito salvo. Agora voce pode seguir para a correcao.")
+
+    if col2.button("Limpar escolhas do gabarito", use_container_width=True):
+        draft = st.session_state.draft_answer_key.copy()
+        for index in range(total_questions):
+            draft[index] = ""
+        st.session_state.draft_answer_key = draft
+        st.info("Escolhas limpas para esta prova.")
 
 
 def render_active_exam_banner():
     active_exam = st.session_state.active_exam
     if not active_exam:
-        st.warning("Cadastre ou carregue uma prova antes de corrigir os alunos.")
+        st.warning("Cadastre uma prova e salve o gabarito antes de corrigir.")
+        return False
+
+    total_questions = get_exam_objective_count(active_exam)
+    if not answer_key_complete(active_exam["answer_key"], total_questions):
+        st.warning("Esta prova ainda nao tem gabarito completo salvo.")
         return False
 
     st.info(
-        f"Prova ativa: {active_exam['title']} | Codigo: {active_exam['code']} | Gabarito: {' '.join(active_exam['answer_key'])}"
+        f"Prova ativa: {active_exam['title']} | Codigo: {active_exam['code']} | Objetivas: {total_questions} | Dissertativas: {get_exam_essay_count(active_exam)}"
     )
     return True
 
 
-def main():
-    st.set_page_config(page_title="Leitor de Gabarito", layout="wide")
-    init_state()
-
+def render_correction_page():
+    st.subheader("3. Corrigir gabaritos")
     exams = load_exams()
-    sync_exam_from_query(exams)
+    selected_exam = render_exam_selector(exams, "Escolha a prova para corrigir") if exams else None
+    if selected_exam and (st.session_state.active_exam_code != selected_exam["code"]):
+        set_active_exam(selected_exam)
 
-    st.title("Leitor de Gabarito")
-    render_exam_registry()
-    st.divider()
-
-    st.subheader("Correcao dos alunos")
     if not render_active_exam_banner():
-        render_saved_results()
+        render_saved_results(st.session_state.active_exam_code or None)
         return
 
+    active_exam = st.session_state.active_exam
     nome = st.text_input("Nome do aluno", key="nome_aluno_input")
     turma = st.text_input("Turma", key="turma_input")
     foto = st.camera_input("Tire uma foto do gabarito", key="foto_gabarito_input")
 
     if foto is None:
         st.info("Tire uma foto do gabarito para iniciar a leitura.")
-        render_saved_results()
+        render_saved_results(active_exam["code"])
         return
 
     imagem = Image.open(foto)
     imagem_bgr = pil_to_bgr(imagem)
-    active_exam = st.session_state.active_exam
 
     try:
         resultado = process_answer_sheet(imagem_bgr)
-        respostas = resultado["respostas"]
+        respostas = resultado["respostas"][: get_exam_objective_count(active_exam)]
         acertos, comparacoes = compute_score(respostas, active_exam["answer_key"])
         st.session_state.last_processed = {
             "nome": nome,
@@ -903,14 +1082,14 @@ def main():
         st.write("Respostas lidas:", " ".join(respostas))
         st.write("Gabarito salvo:", " ".join(active_exam["answer_key"]))
         st.write("Acertos:", acertos)
-        st.write("Erros:", TOTAL_QUESTIONS - acertos)
+        st.write("Erros:", len(active_exam["answer_key"]) - acertos)
 
         comparison_df = pd.DataFrame(comparacoes)
         st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
         if st.button("Salvar correcao deste aluno", type="primary", use_container_width=True):
             registro = build_student_record(nome, turma, active_exam, respostas, acertos, comparacoes)
-            st.session_state.class_results.append(registro)
+            save_result(registro, active_exam["id"])
             st.success("Correcao salva na turma.")
 
         render_diagnostics(resultado)
@@ -918,7 +1097,34 @@ def main():
         st.error(str(error))
         st.image(imagem, caption="Imagem original recebida")
 
-    render_saved_results()
+    render_saved_results(active_exam["code"])
+
+
+def main():
+    st.set_page_config(page_title="Leitor de Gabarito", layout="wide")
+    init_state()
+
+    exams = load_exams()
+    sync_exam_from_query(exams)
+
+    if "current_page" not in st.session_state:
+        st.session_state.current_page = "1. Criar prova"
+
+    st.title("Leitor de Gabarito")
+    st.caption("Fluxo sugerido: criar prova, definir gabarito e depois corrigir a turma.")
+
+    page = st.sidebar.radio(
+        "Etapas",
+        ["1. Criar prova", "2. Definir gabarito", "3. Corrigir gabaritos"],
+        key="current_page",
+    )
+
+    if page == "1. Criar prova":
+        render_create_exam_page()
+    elif page == "2. Definir gabarito":
+        render_answer_key_page()
+    else:
+        render_correction_page()
 
 
 if __name__ == "__main__":
