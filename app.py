@@ -9,6 +9,10 @@ import pandas as pd
 import qrcode
 import streamlit as st
 from PIL import Image
+from docx import Document
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
 from supabase import Client, create_client
 
 
@@ -20,6 +24,12 @@ DEFAULT_GRID = {
     "columns": np.array([218, 354, 490, 626, 762], dtype=np.int32),
     "rows": np.array([282, 376, 469, 563, 657, 751, 844, 938, 1032, 1126], dtype=np.int32),
 }
+DEFAULT_EXAM_HEADER = (
+    "Escola:_____________________________________________________________\n"
+    "Nome:_____________________________________________________________\n"
+    "Data:_____/_____/_______\n"
+    "Serie:________________________________"
+)
 def init_state():
     defaults = {
         "draft_answer_key": [""] * TOTAL_QUESTIONS,
@@ -29,9 +39,12 @@ def init_state():
         "active_exam_code": "",
         "active_exam": None,
         "nav_page": "1. Criar prova",
-        "draft_exam_header": "",
+        "draft_exam_header": DEFAULT_EXAM_HEADER,
         "draft_objective_texts": [""] * TOTAL_QUESTIONS,
         "draft_essay_texts": [],
+        "exam_header_data": DEFAULT_EXAM_HEADER,
+        "objective_texts_data": [""] * TOTAL_QUESTIONS,
+        "essay_texts_data": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -87,6 +100,20 @@ def ensure_question_drafts(objective_count, essay_count):
     else:
         current_essays = current_essays[:essay_count]
     st.session_state.draft_essay_texts = current_essays
+
+    base_objectives = st.session_state.objective_texts_data
+    if len(base_objectives) < objective_count:
+        base_objectives = base_objectives + [""] * (objective_count - len(base_objectives))
+    else:
+        base_objectives = base_objectives[:objective_count]
+    st.session_state.objective_texts_data = base_objectives
+
+    base_essays = st.session_state.essay_texts_data
+    if len(base_essays) < essay_count:
+        base_essays = base_essays + [""] * (essay_count - len(base_essays))
+    else:
+        base_essays = base_essays[:essay_count]
+    st.session_state.essay_texts_data = base_essays
 
 
 def slugify_exam_code(text):
@@ -150,6 +177,9 @@ def map_exam_record(record, answer_key_records=None):
         "answer_key": answers,
         "version": int(record.get("versao", 1)),
         "updated_at": record.get("atualizado_em", ""),
+        "header": DEFAULT_EXAM_HEADER,
+        "objective_texts": [""] * int(record.get("qtd_objetivas", TOTAL_QUESTIONS)),
+        "essay_texts": [""] * int(record.get("qtd_dissertativas", 0)),
     }
 
 
@@ -285,12 +315,9 @@ def set_active_exam(exam):
     st.session_state.saved_answer_key = exam["answer_key"]
     st.session_state.saved_answer_key_version = exam.get("version", 1)
     st.session_state.draft_answer_key = exam["answer_key"].copy()
-    if "header" in exam:
-        st.session_state.draft_exam_header = exam.get("header", "")
-    if "objective_texts" in exam:
-        st.session_state.draft_objective_texts = exam.get("objective_texts", []).copy()
-    if "essay_texts" in exam:
-        st.session_state.draft_essay_texts = exam.get("essay_texts", []).copy()
+    st.session_state.exam_header_data = exam.get("header", "")
+    st.session_state.objective_texts_data = exam.get("objective_texts", []).copy()
+    st.session_state.essay_texts_data = exam.get("essay_texts", []).copy()
 
 
 def sync_exam_from_query(exams):
@@ -960,6 +987,137 @@ def generate_printable_template(exam, exam_url):
 </html>"""
 
 
+def build_exam_docx(exam):
+    document = Document()
+    document.add_heading(exam["title"], level=1)
+
+    for line in (exam.get("header") or DEFAULT_EXAM_HEADER).splitlines():
+        document.add_paragraph(line)
+
+    document.add_paragraph(f"Codigo da prova: {exam['code']}")
+    if exam.get("date"):
+        document.add_paragraph(f"Data da prova: {exam['date']}")
+
+    document.add_paragraph("")
+    document.add_heading("Questoes objetivas", level=2)
+    for index, text in enumerate(exam.get("objective_texts", []), start=1):
+        document.add_paragraph(f"Q{index}. {text or '[Enunciado da questao objetiva]'}")
+        document.add_paragraph("   ( ) A    ( ) B    ( ) C    ( ) D    ( ) E")
+
+    essay_texts = exam.get("essay_texts", [])
+    if essay_texts:
+        document.add_heading("Questoes dissertativas", level=2)
+        for index, text in enumerate(essay_texts, start=1):
+            document.add_paragraph(f"D{index}. {text or '[Enunciado da questao dissertativa]'}")
+            document.add_paragraph("_" * 90)
+            document.add_paragraph("_" * 90)
+            document.add_paragraph("_" * 90)
+
+    output = BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output
+
+
+def draw_wrapped_text(pdf, text, x, y, max_width, font_name="Helvetica", font_size=11, leading=15):
+    words = text.split()
+    current_line = ""
+    lines = []
+
+    for word in words:
+        test_line = f"{current_line} {word}".strip()
+        if stringWidth(test_line, font_name, font_size) <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
+
+    pdf.setFont(font_name, font_size)
+    for line in lines:
+        pdf.drawString(x, y, line)
+        y -= leading
+    return y
+
+
+def build_exam_pdf(exam):
+    output = BytesIO()
+    pdf = canvas.Canvas(output, pagesize=A4)
+    width, height = A4
+    x_margin = 40
+    y = height - 50
+
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(x_margin, y, exam["title"])
+    y -= 28
+
+    pdf.setFont("Helvetica", 11)
+    for line in (exam.get("header") or DEFAULT_EXAM_HEADER).splitlines():
+        pdf.drawString(x_margin, y, line)
+        y -= 16
+
+    pdf.drawString(x_margin, y, f"Codigo da prova: {exam['code']}")
+    y -= 16
+    if exam.get("date"):
+        pdf.drawString(x_margin, y, f"Data da prova: {exam['date']}")
+        y -= 22
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x_margin, y, "Questoes objetivas")
+    y -= 20
+
+    for index, text in enumerate(exam.get("objective_texts", []), start=1):
+        if y < 90:
+            pdf.showPage()
+            y = height - 50
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(x_margin, y, f"Q{index}.")
+        y = draw_wrapped_text(
+            pdf,
+            text or "[Enunciado da questao objetiva]",
+            x_margin + 28,
+            y,
+            width - (x_margin * 2) - 28,
+        )
+        pdf.setFont("Helvetica", 11)
+        pdf.drawString(x_margin + 28, y, "( ) A    ( ) B    ( ) C    ( ) D    ( ) E")
+        y -= 24
+
+    essay_texts = exam.get("essay_texts", [])
+    if essay_texts:
+        if y < 120:
+            pdf.showPage()
+            y = height - 50
+        pdf.setFont("Helvetica-Bold", 13)
+        pdf.drawString(x_margin, y, "Questoes dissertativas")
+        y -= 20
+
+        for index, text in enumerate(essay_texts, start=1):
+            if y < 130:
+                pdf.showPage()
+                y = height - 50
+            pdf.setFont("Helvetica-Bold", 11)
+            pdf.drawString(x_margin, y, f"D{index}.")
+            y = draw_wrapped_text(
+                pdf,
+                text or "[Enunciado da questao dissertativa]",
+                x_margin + 28,
+                y,
+                width - (x_margin * 2) - 28,
+            )
+            for _ in range(4):
+                pdf.line(x_margin, y, width - x_margin, y)
+                y -= 18
+            y -= 6
+
+    pdf.save()
+    output.seek(0)
+    return output
+
+
 def render_exam_selector(exams, label="Selecione uma prova"):
     if not exams:
         st.info("Nenhuma prova cadastrada ainda.")
@@ -1005,20 +1163,29 @@ def render_create_exam_page():
         help="No Streamlit Cloud, e algo como https://nome-do-app.streamlit.app",
     )
     ensure_question_drafts(objective_questions, essay_questions)
+    if not st.session_state.draft_exam_header and st.session_state.exam_header_data:
+        st.session_state.draft_exam_header = st.session_state.exam_header_data
+    for question_index in range(int(objective_questions)):
+        widget_key = f"objective_text_{question_index}"
+        if widget_key not in st.session_state and question_index < len(st.session_state.objective_texts_data):
+            st.session_state[widget_key] = st.session_state.objective_texts_data[question_index]
+    for question_index in range(int(essay_questions)):
+        widget_key = f"essay_text_{question_index}"
+        if widget_key not in st.session_state and question_index < len(st.session_state.essay_texts_data):
+            st.session_state[widget_key] = st.session_state.essay_texts_data[question_index]
 
     st.markdown("**Cabecalho da prova**")
     exam_header = st.text_area(
         "Texto do cabecalho/instrucoes",
         key="draft_exam_header",
-        placeholder="Exemplo: Leia atentamente as questoes e marque apenas uma alternativa nas objetivas.",
-        height=120,
+        placeholder=DEFAULT_EXAM_HEADER,
+        height=140,
     )
 
     st.markdown("**Questoes objetivas**")
     for question_index in range(int(objective_questions)):
         st.session_state.draft_objective_texts[question_index] = st.text_area(
             f"Enunciado da objetiva Q{question_index + 1}",
-            value=st.session_state.draft_objective_texts[question_index],
             key=f"objective_text_{question_index}",
             height=80,
             placeholder=f"Digite aqui o enunciado da questao objetiva {question_index + 1}",
@@ -1029,7 +1196,6 @@ def render_create_exam_page():
         for question_index in range(int(essay_questions)):
             st.session_state.draft_essay_texts[question_index] = st.text_area(
                 f"Enunciado da dissertativa D{question_index + 1}",
-                value=st.session_state.draft_essay_texts[question_index],
                 key=f"essay_text_{question_index}",
                 height=90,
                 placeholder=f"Digite aqui o enunciado da questao dissertativa {question_index + 1}",
@@ -1074,6 +1240,32 @@ def render_create_exam_page():
             st.image(build_qr_image(exam_url), caption="QR da prova", width=220)
         else:
             st.info("Se voce preencher a URL publica do app, o QR e o link serao gerados aqui.")
+
+        printable_html = generate_printable_template(selected_exam, exam_url)
+        docx_file = build_exam_docx(selected_exam)
+        pdf_file = build_exam_pdf(selected_exam)
+        export_col1, export_col2, export_col3 = st.columns(3)
+        export_col1.download_button(
+            "Baixar HTML da prova",
+            data=printable_html.encode("utf-8"),
+            file_name=f"prova_{selected_exam['code'].lower()}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+        export_col2.download_button(
+            "Baixar Word da prova",
+            data=docx_file,
+            file_name=f"prova_{selected_exam['code'].lower()}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+        export_col3.download_button(
+            "Baixar PDF da prova",
+            data=pdf_file,
+            file_name=f"prova_{selected_exam['code'].lower()}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 
 def render_answer_key_page():
