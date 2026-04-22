@@ -28,6 +28,10 @@ def init_state():
         "last_processed": None,
         "active_exam_code": "",
         "active_exam": None,
+        "nav_page": "1. Criar prova",
+        "draft_exam_header": "",
+        "draft_objective_texts": [""] * TOTAL_QUESTIONS,
+        "draft_essay_texts": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -61,6 +65,30 @@ def generate_exam_code(title, exam_date):
     return f"{base}-{timestamp}" if base else f"PROVA-{timestamp}"
 
 
+def go_to_page(page_name):
+    st.session_state.nav_page = page_name
+    st.rerun()
+
+
+def ensure_question_drafts(objective_count, essay_count):
+    objective_count = int(objective_count)
+    essay_count = int(essay_count)
+
+    current_objectives = st.session_state.draft_objective_texts
+    if len(current_objectives) < objective_count:
+        current_objectives = current_objectives + [""] * (objective_count - len(current_objectives))
+    else:
+        current_objectives = current_objectives[:objective_count]
+    st.session_state.draft_objective_texts = current_objectives
+
+    current_essays = st.session_state.draft_essay_texts
+    if len(current_essays) < essay_count:
+        current_essays = current_essays + [""] * (essay_count - len(current_essays))
+    else:
+        current_essays = current_essays[:essay_count]
+    st.session_state.draft_essay_texts = current_essays
+
+
 def slugify_exam_code(text):
     allowed = []
     for char in text.strip().upper():
@@ -76,8 +104,30 @@ def slugify_exam_code(text):
 
 @st.cache_resource
 def get_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    url = None
+    key = None
+
+    try:
+        url = st.secrets["SUPABASE_URL"]
+    except Exception:
+        pass
+
+    try:
+        key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        pass
+
+    if (not url or not key) and "supabase" in st.secrets:
+        supabase_block = st.secrets["supabase"]
+        url = url or supabase_block.get("url")
+        key = key or supabase_block.get("key")
+
+    if not url or not key:
+        raise RuntimeError(
+            "Configure os secrets do Supabase no Streamlit. Use SUPABASE_URL e SUPABASE_KEY "
+            "ou o bloco [supabase] com url e key."
+        )
+
     return create_client(url, key)
 
 
@@ -156,7 +206,11 @@ def save_exam(exam):
         .single()
         .execute()
     )
-    return map_exam_record(fresh_exam.data)
+    saved_exam = map_exam_record(fresh_exam.data)
+    for optional_key in ("header", "objective_texts", "essay_texts"):
+        if optional_key in exam:
+            saved_exam[optional_key] = exam[optional_key]
+    return saved_exam
 
 
 def load_results(exam_code=None):
@@ -231,6 +285,12 @@ def set_active_exam(exam):
     st.session_state.saved_answer_key = exam["answer_key"]
     st.session_state.saved_answer_key_version = exam.get("version", 1)
     st.session_state.draft_answer_key = exam["answer_key"].copy()
+    if "header" in exam:
+        st.session_state.draft_exam_header = exam.get("header", "")
+    if "objective_texts" in exam:
+        st.session_state.draft_objective_texts = exam.get("objective_texts", []).copy()
+    if "essay_texts" in exam:
+        st.session_state.draft_essay_texts = exam.get("essay_texts", []).copy()
 
 
 def sync_exam_from_query(exams):
@@ -944,10 +1004,41 @@ def render_create_exam_page():
         key="base_url_input",
         help="No Streamlit Cloud, e algo como https://nome-do-app.streamlit.app",
     )
+    ensure_question_drafts(objective_questions, essay_questions)
+
+    st.markdown("**Cabecalho da prova**")
+    exam_header = st.text_area(
+        "Texto do cabecalho/instrucoes",
+        key="draft_exam_header",
+        placeholder="Exemplo: Leia atentamente as questoes e marque apenas uma alternativa nas objetivas.",
+        height=120,
+    )
+
+    st.markdown("**Questoes objetivas**")
+    for question_index in range(int(objective_questions)):
+        st.session_state.draft_objective_texts[question_index] = st.text_area(
+            f"Enunciado da objetiva Q{question_index + 1}",
+            value=st.session_state.draft_objective_texts[question_index],
+            key=f"objective_text_{question_index}",
+            height=80,
+            placeholder=f"Digite aqui o enunciado da questao objetiva {question_index + 1}",
+        )
+
+    if int(essay_questions) > 0:
+        st.markdown("**Questoes dissertativas**")
+        for question_index in range(int(essay_questions)):
+            st.session_state.draft_essay_texts[question_index] = st.text_area(
+                f"Enunciado da dissertativa D{question_index + 1}",
+                value=st.session_state.draft_essay_texts[question_index],
+                key=f"essay_text_{question_index}",
+                height=90,
+                placeholder=f"Digite aqui o enunciado da questao dissertativa {question_index + 1}",
+            )
 
     generated_code = generate_exam_code(exam_title or "PROVA", exam_date or datetime.now().strftime("%Y-%m-%d"))
     st.code(generated_code, language="text")
     st.caption("Esse codigo sera salvo com a prova e usado no link/QR quando voce quiser gerar consulta automatica.")
+    st.info("Os textos do cabecalho e das questoes ja podem ser escritos aqui. No passo seguinte, eu recomendo persistir isso no banco com uma migracao extra.")
 
     exams = load_exams()
     if st.button("Salvar estrutura da prova", type="primary", use_container_width=True):
@@ -963,11 +1054,14 @@ def render_create_exam_page():
                 "answer_key": [""] * int(objective_questions),
                 "version": exams.get(generated_code, {}).get("version", 0),
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "header": exam_header,
+                "objective_texts": st.session_state.draft_objective_texts[: int(objective_questions)],
+                "essay_texts": st.session_state.draft_essay_texts[: int(essay_questions)],
             }
             saved_exam = save_exam(exam)
             set_active_exam(saved_exam)
-            st.session_state.current_page = "2. Definir gabarito"
             st.success("Prova criada. O proximo passo e definir o gabarito.")
+            go_to_page("2. Definir gabarito")
 
     selected_exam = render_exam_selector(exams, "Provas ja cadastradas")
     if selected_exam:
@@ -1009,8 +1103,8 @@ def render_answer_key_page():
             saved_exam["updated_at"] = datetime.now().isoformat(timespec="seconds")
             persisted_exam = save_exam(saved_exam)
             set_active_exam(persisted_exam)
-            st.session_state.current_page = "3. Corrigir gabaritos"
             st.success("Gabarito salvo. Agora voce pode seguir para a correcao.")
+            go_to_page("3. Corrigir gabaritos")
 
     if col2.button("Limpar escolhas do gabarito", use_container_width=True):
         draft = st.session_state.draft_answer_key.copy()
@@ -1107,16 +1201,13 @@ def main():
     exams = load_exams()
     sync_exam_from_query(exams)
 
-    if "current_page" not in st.session_state:
-        st.session_state.current_page = "1. Criar prova"
-
     st.title("Leitor de Gabarito")
     st.caption("Fluxo sugerido: criar prova, definir gabarito e depois corrigir a turma.")
 
     page = st.sidebar.radio(
         "Etapas",
         ["1. Criar prova", "2. Definir gabarito", "3. Corrigir gabaritos"],
-        key="current_page",
+        key="nav_page",
     )
 
     if page == "1. Criar prova":
