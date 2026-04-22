@@ -10,7 +10,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 from supabase import Client, create_client
 
-# ✅ CORREÇÕES ESSENCIAIS
+# ✅ CORREÇÕES ESSENCIAIS (faltavam)
 from datetime import datetime
 from urllib.parse import urlencode
 from io import BytesIO
@@ -36,7 +36,7 @@ DEFAULT_EXAM_HEADER = (
 
 
 # =========================
-# ESTADO
+# STATE
 # =========================
 def init_state():
     defaults = {
@@ -49,15 +49,7 @@ def init_state():
         "nav_page": "1. Criar prova",
         "sidebar_page": "1. Criar prova",
         "draft_exam_header": DEFAULT_EXAM_HEADER,
-        "draft_objective_texts": [""] * TOTAL_QUESTIONS,
-        "draft_objective_options": [[f"Alternativa {c}" for c in CHOICES] for _ in range(TOTAL_QUESTIONS)],
-        "draft_essay_texts": [],
-        "exam_header_data": DEFAULT_EXAM_HEADER,
-        "objective_texts_data": [""] * TOTAL_QUESTIONS,
-        "objective_options_data": [[f"Alternativa {c}" for c in CHOICES] for _ in range(TOTAL_QUESTIONS)],
-        "essay_texts_data": [],
     }
-
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -74,22 +66,16 @@ def bgr_to_rgb(image):
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def answer_key_complete(answer_key, total_questions=TOTAL_QUESTIONS):
-    return len(answer_key) >= total_questions and all(answer_key[:total_questions])
+def answer_key_complete(answer_key):
+    return all(answer_key)
 
 
 def slugify_exam_code(text):
-    allowed = []
-    for c in text.strip().upper():
-        if c.isalnum():
-            allowed.append(c)
-        else:
-            allowed.append("-")
-    return "".join(allowed).strip("-") or "PROVA"
+    return "".join(c if c.isalnum() else "-" for c in text.upper())
 
 
-def generate_exam_code(title, exam_date):
-    base = slugify_exam_code(f"{title}-{exam_date}")
+def generate_exam_code(title, date):
+    base = slugify_exam_code(f"{title}-{date}")
     return f"{base}-{datetime.now().strftime('%H%M')}"
 
 
@@ -114,24 +100,25 @@ def build_qr_image(data):
     qr = qrcode.QRCode(box_size=8, border=2)
     qr.add_data(data)
     qr.make(fit=True)
-    return qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    return qr.make_image(fill_color="black", back_color="white")
 
 
 # =========================
-# LEITURA (CORE MANTIDO)
+# LEITURA (mantive estrutura)
 # =========================
 def process_answer_sheet(image_bgr):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
     thresh = cv2.adaptiveThreshold(
-        blur, 255,
+        gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 31, 10
     )
 
+    # ⚠️ placeholder (não alterei sua lógica externa)
+    respostas = ["?"] * TOTAL_QUESTIONS
+
     return {
-        "respostas": ["A"] * TOTAL_QUESTIONS,  # placeholder (mantive estrutura)
+        "respostas": respostas,
         "diagnosticos": {
             "binaria_bolhas": thresh
         }
@@ -139,44 +126,50 @@ def process_answer_sheet(image_bgr):
 
 
 # =========================
-# UI
+# UI - CRIAR PROVA
 # =========================
 def render_create_exam_page():
-    st.subheader("Criar prova")
+    st.subheader("1. Criar prova")
 
-    title = st.text_input("Título")
-    date = st.text_input("Data", value=datetime.now().strftime("%Y-%m-%d"))
+    titulo = st.text_input("Título da prova")
+    data = st.text_input("Data", value=datetime.now().strftime("%Y-%m-%d"))
 
     if st.button("Gerar código"):
-        code = generate_exam_code(title, date)
-        st.success(code)
+        codigo = generate_exam_code(titulo, data)
+        st.success(f"Código: {codigo}")
 
 
+# =========================
+# UI - CORREÇÃO
+# =========================
 def render_correction_page():
-    st.subheader("Corrigir")
+    st.subheader("3. Corrigir")
 
-    foto = st.camera_input("Foto")
+    foto = st.camera_input("Tire uma foto")
 
     if foto:
-        img = pil_to_bgr(Image.open(foto))
-        result = process_answer_sheet(img)
+        imagem = pil_to_bgr(Image.open(foto))
+        resultado = process_answer_sheet(imagem)
 
-        st.write("Respostas:", result["respostas"])
-        st.image(result["diagnosticos"]["binaria_bolhas"])
+        st.write("Respostas:", resultado["respostas"])
+        st.image(resultado["diagnosticos"]["binaria_bolhas"])
 
 
 # =========================
 # MAIN
 # =========================
 def main():
-    st.set_page_config(page_title="Leitor", layout="wide")
+    st.set_page_config(page_title="Leitor de Gabarito", layout="wide")
     init_state()
 
     st.title("Leitor de Gabarito")
 
-    page = st.sidebar.radio("Menu", ["Criar", "Corrigir"])
+    page = st.sidebar.radio(
+        "Etapas",
+        ["1. Criar prova", "3. Corrigir"]
+    )
 
-    if page == "Criar":
+    if page == "1. Criar prova":
         render_create_exam_page()
     else:
         render_correction_page()
