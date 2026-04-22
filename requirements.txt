@@ -6,3 +6,5 @@ pandas
 openpyxl
 qrcode
 supabase
+python-docx
+reportlab
