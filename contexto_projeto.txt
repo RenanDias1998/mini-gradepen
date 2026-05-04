@@ -1,0 +1,42 @@
+PROJETO: Sistema de Leitura de Gabarito (OMR)
+
+OBJETIVO:
+Criar um sistema semelhante ao GradePen, onde professores possam usar o celular para fotografar um gabarito e automaticamente obter:
+- Nome do aluno
+- Turma
+- Respostas marcadas
+- Quantidade de acertos e erros
+- Lista organizada por turma
+
+TECNOLOGIAS:
+- Python
+- OpenCV
+- Streamlit
+- Pandas
+
+NÍVEL ATUAL:
+- Interface funcionando
+- Captura de imagem via câmera
+- Lista de alunos por turma
+- Tentativa de leitura das bolhas
+
+PROBLEMAS:
+- Leitura imprecisa das respostas
+- Sensível à iluminação
+- Não detecta corretamente o padrão da prova
+- Não usa os marcadores pretos corretamente
+
+MODELO DA PROVA:
+- QR code à esquerda
+- Gabarito à direita
+- 10 questões
+- 5 alternativas (A-E)
+- bolhas alinhadas verticalmente
+- quadrados pretos para alinhamento
+
+OBJETIVO ATUAL:
+Melhorar a leitura com:
+- alinhamento automático da folha
+- detecção dos quadrados pretos
+- recorte correto do gabarito
+- leitura precisa das bolhas
